@@ -1,0 +1,664 @@
+#include <stdio.h>
+#include <sys/ioctl.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <gtk/gtk.h>
+#include <linux/videodev2.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <string.h>
+#include "color.h"
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/types.h>
+#include <arpa/inet.h>
+#include <opencv2/opencv.hpp>
+
+using namespace std;
+#define CLEAR(x) memset (&(x), 0, sizeof (x))
+GThread *thread=0;
+char dev_name[128] = "/dev/video0";
+int width = 320;
+int height = 240;
+int preview_width = 320;
+int preview_height = 240;
+int FPS = 10;//Max Power
+int USER=-1;
+int MAXRETRYTIME=2000;
+int retryTime=0;
+struct buffer {
+        void *                  start;
+        size_t                  length;
+};
+char susername[400];
+char sreason[400];
+buffer *buffers = NULL;
+int sockfd;
+char netbuffer[1024];
+struct sockaddr_in server_addr;
+struct hostent *host;
+int portnumber=19999,nbytes;
+int fd = -1;
+int reqbuf_count = 4;
+int refreshcount=0;
+
+GtkWidget *window;
+GtkWidget *image_face;
+GMutex *mutex = NULL;
+//=======Widget==
+GtkWidget *statuslabel;
+GtkWidget *statusframe;
+GtkWidget *hPaned;
+GtkWidget *vbox;
+GtkWidget *hbox;
+GtkWidget *svbox;
+GtkWidget *svframe;
+GtkWidget *svlabel;
+GtkWidget *polyuimage;
+GtkWidget *scrolledWindow;
+GtkWidget *textView;
+bool isSocketAlive=false;
+bool hasCreate=false;
+int punishTime=0;
+//========GThread=========
+gpointer camera_thread(gpointer arg);
+
+unsigned char *buf2=NULL;
+unsigned char *buf3=NULL;
+//========================
+
+
+static GdkPixmap *pixmap = NULL;
+unsigned char framebuffer[2048 * 1536 * 3];
+
+guint timeId = 0;
+bool init_network();
+void open_device();
+void init_device();
+void set_format();
+void request_buffer();
+void query_buf_and_mmap();
+void queue_buffer();
+void stream_on();
+void read_frame();
+static gboolean show_camera(gpointer data);
+void stream_off();
+void mem_unmap_and_close_dev();
+int xioctl(int fd, int request, void* arg);
+//===============================================
+static gboolean change_status(gpointer data);
+static gboolean show_finish(gpointer data);
+int statuscode=-1;
+int process=0;
+//===============================================
+
+
+int main( int argc, char *argv[])
+{
+	gtk_init (&argc, &argv);
+
+	window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
+	//layout = gtk_layout_new (NULL, NULL);
+//==========================
+ 	hPaned = gtk_hpaned_new();
+    mutex = g_mutex_new();
+
+    polyuimage=gtk_image_new_from_file("/opt/logo.gif");
+    statuslabel=gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(statuslabel),"<span foreground='blue' size='x-large'>Innovative Intelligent Computing Center</span>");
+    statusframe = gtk_frame_new(" ");
+    vbox = gtk_vbox_new(FALSE, 5);
+    hbox = gtk_hbox_new(FALSE, 5);
+    scrolledWindow = gtk_scrolled_window_new(NULL, NULL);
+    textView = gtk_text_view_new();
+    svbox= gtk_vbox_new(FALSE, 5);
+    svframe = gtk_frame_new(" ");
+    svlabel=gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(svlabel),
+          "<span foreground='blue' size='x-large'>System Running</span>");
+//==========================
+    gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
+	gtk_window_maximize(GTK_WINDOW (window));
+	gtk_window_set_title (GTK_WINDOW (window), "Authentication");
+
+    gtk_scrolled_window_set_policy( GTK_SCROLLED_WINDOW(scrolledWindow),GTK_POLICY_NEVER,GTK_POLICY_ALWAYS);
+    gtk_text_view_set_editable(GTK_TEXT_VIEW (textView),false);
+    gtk_widget_set_sensitive(textView, FALSE);
+//===========================================================
+
+//===========================================================
+    gtk_container_set_border_width (GTK_CONTAINER (window), 0);
+	image_face = gtk_drawing_area_new ();
+	gtk_widget_set_size_request(image_face, preview_width, preview_height);
+//===================================
+    gtk_container_add(GTK_CONTAINER(scrolledWindow), textView);
+    gtk_box_pack_start(GTK_BOX(hbox), polyuimage, FALSE, TRUE, 5);
+    gtk_box_pack_start(GTK_BOX(hbox), statuslabel, TRUE, TRUE, 5);
+    gtk_container_add(GTK_CONTAINER(statusframe), hbox);
+    gtk_box_pack_start(GTK_BOX(vbox), statusframe, TRUE, TRUE, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), hPaned, TRUE, TRUE, 5);
+    gtk_container_add(GTK_CONTAINER(svframe), svlabel);
+    gtk_box_pack_start(GTK_BOX(svbox), svframe, TRUE, TRUE, 5);
+    gtk_box_pack_start(GTK_BOX(svbox), scrolledWindow, TRUE, TRUE, 5);
+
+
+	gtk_paned_pack1(GTK_PANED(hPaned), 
+                    image_face, TRUE, TRUE);
+      gtk_paned_pack2(GTK_PANED(hPaned),
+                    svbox, TRUE, TRUE);
+    gtk_container_add(GTK_CONTAINER(window), vbox);
+//====================================
+	gtk_widget_show_all(window);
+
+	
+
+	open_device();
+
+   	init_device();
+
+    init_network();
+
+	stream_on();
+
+	// defined in color.h, and used to pixel format changing 
+	initLut(); 
+
+    if(!g_thread_supported()) {
+            g_thread_init(NULL);
+        }
+    
+        timeId = g_timeout_add(1000/FPS, show_camera, NULL);
+    
+
+
+	gtk_main ();
+
+	freeLut();
+
+	stream_off();
+
+	mem_unmap_and_close_dev();
+
+	return 0;
+}
+
+gpointer camera_thread(gpointer arg) 
+{
+        if(g_mutex_trylock(mutex))
+        {
+            int hasSend=0;
+            int needSend=width*height*3;
+            int temp;
+            //statuscode=1;
+//            /g_timeout_add(1000/FPS, change_status, NULL);
+            while(true)
+            {
+                temp=send(sockfd, (void*)buf3,needSend , 0);
+                if(temp<0)
+                {
+                    fprintf(stderr,"Socket Error:%s\a\n",strerror(errno));
+                    isSocketAlive=false;
+                    //g_mutex_unlock(mutex);
+                    return FALSE;
+                }
+                else
+                {
+                    hasSend+=temp;
+                    if(hasSend==needSend)
+                    {
+                        //printf("One Picture Send!\n");
+                        break;
+                    }
+                }
+            }
+            int needRecv=256;
+            int tempRecv=0;
+            while(true)
+            {
+                if((nbytes=read(sockfd,netbuffer,1024))==-1)
+                {
+                                fprintf(stderr,"Read Error:%s\n",strerror(errno));
+                                exit(1);
+                }
+                else
+                {
+                    tempRecv+=nbytes;
+                    if(tempRecv==needRecv)
+                    {
+                        printf("%s\n",netbuffer);
+                        break;
+                    }
+
+                }
+            }
+            if(netbuffer[0]=='S'&&netbuffer[1]=='u'&&netbuffer[2]=='c')
+            {
+                statuscode=2;
+                memset(susername,'\0',sizeof(susername));
+
+                strcpy(susername,netbuffer+8);
+                punishTime=100;
+                g_timeout_add(1000/FPS, change_status, NULL);
+            }
+            else
+            {
+                statuscode=3;
+                punishTime=5;
+                memset(sreason,'\0',sizeof(sreason));
+                strcpy(sreason,netbuffer);
+                g_timeout_add(1000/FPS, change_status, NULL);
+            }
+            delete [] buf3;
+            g_mutex_unlock(mutex);
+        }
+}
+
+
+
+void open_device()
+{
+	fd = open (dev_name, O_RDWR|O_NONBLOCK, 0);
+	if(-1 == fd) {
+		printf("open device error\n");
+		/* Error handler */ 
+	}
+}
+
+void init_device()
+{
+	set_format();
+	request_buffer();
+	query_buf_and_mmap();
+	queue_buffer();
+}
+
+bool init_network()
+{
+    if((host=gethostbyname("192.168.2.1"))==NULL)
+     {
+         return false;
+     }
+    if((sockfd=socket(AF_INET,SOCK_STREAM,0))==-1)
+    {
+                    fprintf(stderr,"Socket Error:%s\a\n",strerror(errno));
+                    return false;
+    }
+    bzero(&server_addr,sizeof(server_addr));
+    server_addr.sin_family=AF_INET;
+    server_addr.sin_port=htons(portnumber);
+    server_addr.sin_addr=*((struct in_addr *)host->h_addr);
+    if(connect(sockfd,(struct sockaddr *)(&server_addr),sizeof(struct sockaddr))==-1)
+    {
+                    fprintf(stderr,"Connect Error:%s\a\n",strerror(errno));
+                    return false;
+                    //return;
+    }
+    int needRecv=64;
+    int tempRecv=0;
+    while(true)
+    {
+        if((nbytes=read(sockfd,netbuffer,1024))==-1)
+        {
+                        fprintf(stderr,"Read Error:%s\n",strerror(errno));
+                       return false;
+        }
+        else
+        {
+            tempRecv+=nbytes;
+            if(tempRecv==needRecv)
+            {
+                printf("Server connected:%s:%d\n",netbuffer,nbytes);
+                isSocketAlive=true;
+                return true;
+            }
+        }
+    }
+    printf("Server Protocol Failed");
+    isSocketAlive=false;
+    return false;
+}
+
+void set_format()
+{
+	struct v4l2_format fmt;
+	CLEAR (fmt);
+
+	fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fmt.fmt.pix.width       = width;
+	fmt.fmt.pix.height      = height;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+
+ 	if(-1 == xioctl (fd, VIDIOC_S_FMT, &fmt))
+ 	{
+		printf("set format error\n");
+   		// Error handler
+	}
+}
+
+void request_buffer()
+{
+	struct v4l2_requestbuffers req;
+	CLEAR (req);
+
+	req.count               = reqbuf_count;
+	req.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory              = V4L2_MEMORY_MMAP;
+
+	if(-1 == xioctl (fd, VIDIOC_REQBUFS, &req))
+	{
+		printf("request buf error\n");
+		// Error handler
+	}
+}
+
+void query_buf_and_mmap()
+{
+	buffers = (buffer*) calloc(reqbuf_count, sizeof(*buffers) );
+	if(!buffers)
+	{
+		// Error handler
+	}
+
+	struct v4l2_buffer buf;
+	for(int i = 0; i < reqbuf_count; ++i)
+	{
+		CLEAR (buf);
+
+		buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index  = i;
+
+		if(-1 == xioctl(fd, VIDIOC_QUERYBUF, &buf))
+        {
+			printf("query buf error\n");
+        	// Error handler
+		}
+		//printf("buffer length: %d\n", buf.length);
+		//printf("buffer offset: %d\n", buf.m.offset);	
+
+		buffers[i].length = buf.length;
+		buffers[i].start = mmap(NULL,
+									buf.length,
+									PROT_READ|PROT_WRITE,
+									MAP_SHARED,
+									fd,
+									buf.m.offset);
+
+		if(MAP_FAILED == buffers[i].start)
+		{
+			// Error handler
+		}
+	}
+}
+
+void queue_buffer()
+{
+	struct v4l2_buffer buf;
+
+	for(int i = 0; i < reqbuf_count; ++i) {
+
+		CLEAR (buf);
+
+		buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index  = i;
+
+		if(-1 == xioctl(fd, VIDIOC_QBUF, &buf))
+		{
+			// Error handler
+		}
+	}
+}
+
+void stream_on()
+{
+	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if(-1 == xioctl(fd, VIDIOC_STREAMON, &type))
+	{
+		// Error handler
+	}
+}
+
+void read_frame()
+{	
+	struct v4l2_buffer buf;
+	unsigned int i;
+       
+	CLEAR (buf);
+	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	buf.memory = V4L2_MEMORY_MMAP;
+	if(-1 == xioctl (fd, VIDIOC_DQBUF, &buf)) 
+	{
+		// Error handler
+	}
+//	assert (buf.index < n_buffers0);
+   
+	memcpy(framebuffer, buffers[buf.index].start, buf.bytesused);
+	
+	if(-1 == xioctl (fd, VIDIOC_QBUF, &buf))
+	{
+		// Error handler
+	} 
+}
+
+static gboolean show_camera(gpointer data)
+{
+   
+        read_frame();
+        buf2 = new unsigned char[width*height*3];
+
+        Pyuv422torgb24((unsigned char*)framebuffer, buf2, width, height);
+        if(punishTime<=0)
+        {
+            if(!isSocketAlive)
+            {
+                    init_network();
+                    statuscode=9;
+                    g_timeout_add(1000/50, change_status, NULL);
+
+            }
+            if(g_mutex_trylock(mutex)&&isSocketAlive)
+            {
+                buf3 = new unsigned char[width*height*3];
+                memcpy(buf3,buf2,width*height*3);
+                g_mutex_unlock(mutex);
+                g_thread_create(camera_thread, NULL, FALSE, NULL);
+
+            }
+        }
+        else
+        {
+            punishTime--;
+            if(punishTime==0)
+            {
+                gtk_label_set_markup(GTK_LABEL(svlabel),
+                    "<span foreground='blue' size='x-large'>System Ready.</span>");
+
+            }
+        }
+
+        if(pixmap) {
+            g_object_unref(pixmap); // ref count minus one
+        }
+
+        pixmap = gdk_pixmap_new (image_face->window, preview_width, preview_height, -1);
+
+        GdkPixbuf *rgbBuf = gdk_pixbuf_new_from_data(buf2, GDK_COLORSPACE_RGB, FALSE, 8,width, height, width*3, NULL, NULL);
+
+        if(rgbBuf != NULL)
+        {
+            /*GdkPixbuf* buf = gdk_pixbuf_scale_simple(rgbBuf,
+                                                                preview_width,
+                                                                preview_height,
+                                                                GDK_INTERP_BILINEAR);*/
+            gdk_draw_pixbuf(pixmap,
+                                image_face->style->white_gc,
+                                rgbBuf,
+                                0, 0, 0, 0,
+                                preview_width,
+                                preview_height,
+                                GDK_RGB_DITHER_NONE,
+                                0, 0);
+            gdk_draw_drawable(image_face->window,
+                                  image_face->style->white_gc,
+                                  pixmap,
+                                  0, 0, 60, 30,
+                                  preview_width,
+                                  preview_height);
+            //g_object_unref(buf);
+            g_object_unref(rgbBuf);
+        }
+
+        gtk_widget_show(image_face);
+
+        delete [] buf2;
+
+
+    return TRUE;
+}
+
+void stream_off(void)
+{
+	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if(-1 == xioctl(fd, VIDIOC_STREAMOFF, &type))
+	{
+		// Error handler
+	}
+}
+
+void mem_unmap_and_close_dev()
+{
+	for(int i = 0; i < reqbuf_count; ++i)
+	{
+		if(-1 == munmap(buffers[i].start, buffers[i].length))
+		{
+			// Error hanlder
+		}
+	}
+
+	free(buffers);
+	close(fd);
+}
+
+int xioctl(int fd, int request, void* arg)
+{
+	int r;
+
+	do r = ioctl (fd, request, arg);
+	while (-1 == r && EINTR == errno);
+
+	return r;
+}
+static gboolean show_finish(gpointer data)
+{
+
+    system("python /opt/OpenDoor.py &");
+    return false;
+}
+static gboolean change_status(gpointer data)
+{
+
+    refreshcount++;
+    GtkTextBuffer *buffer;
+    buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW (textView));
+
+    if(refreshcount>100)
+    {
+        char standbytext[200]="~~~Face Authentication Ready Now~~~!\n";
+        gtk_text_buffer_set_text (buffer,standbytext,-1);
+        refreshcount=0;
+    }
+    GtkTextMark *mark;
+    GtkTextIter iter;
+    mark = gtk_text_buffer_get_insert(buffer);
+    gtk_text_buffer_get_iter_at_mark(buffer, &iter, mark);
+    if(!hasCreate)
+    {
+        gtk_text_buffer_create_tag(buffer,"red_background","foreground","red",NULL);
+        gtk_text_buffer_create_tag(buffer,"blue_background","foreground","blue",NULL);
+        char standbytext[200]="~~~Face Authentication Ready Now~~~!\n";
+        gtk_text_buffer_set_text (buffer,standbytext,-1);
+        hasCreate=true;
+    }
+    time_t timep;
+    struct tm *p;
+    time(&timep);
+    p=localtime(&timep);
+
+    switch(statuscode)
+    {
+        case 1:
+        {
+            char text[200];
+            sprintf(text,"%02d:%02d:%02d: Checking Face.Please Wait!\n",p->tm_hour,p->tm_min,p->tm_sec);
+            gtk_text_buffer_insert (buffer,&iter,text,-1);
+        }
+            break;
+        case 2:
+        {
+        char text[400];
+        char text1[400];
+        process=0;
+        refreshcount=101;
+        sprintf(text,"\n%02d:%02d:%02d: Welcome %s.\n",p->tm_hour,p->tm_min,p->tm_sec,susername);
+        sprintf(text1,"<span foreground='blue' size='x-large'>Welcome %s.</span>",susername);
+        gtk_text_buffer_insert_with_tags_by_name(buffer,&iter,text,
+        -1,"blue_background",NULL);
+        //gtk_text_buffer_insert (buffer,&iter,text,-1);
+        gtk_label_set_markup(GTK_LABEL(svlabel),
+             text1);
+        g_timeout_add(1000/FPS, show_finish, NULL);
+        }
+            break;
+        case 3:
+        {
+            if(process>=10)
+            {
+            process=0;
+            char text[200];
+
+            sprintf(text,"%02d:%02d:%02d: Authentication Failed.\n",p->tm_hour,p->tm_min,p->tm_sec);
+            //gtk_text_buffer_insert (buffer,&iter,text,-1);
+            gtk_text_buffer_insert_with_tags_by_name(buffer,&iter,text,
+            -1,"red_background",NULL);
+            gtk_text_buffer_insert (buffer,&iter,sreason,-1);
+            }
+            else
+            {
+                process++;
+                if(process==1)
+                {
+                    char text[200];
+                    sprintf(text,"%02d:%02d:%02d:Processing  :.",p->tm_hour,p->tm_min,p->tm_sec);
+                    gtk_text_buffer_insert (buffer,&iter,text,-1);
+                }
+                else if(process<10&&process>1)
+                {
+                    gtk_text_buffer_insert (buffer,&iter,".",-1);
+                }
+                else if(process==10)
+                {
+                    gtk_text_buffer_insert (buffer,&iter,"\n",-1);
+                }
+            }
+
+        }
+        break;
+        case 9:
+        {
+            gtk_text_buffer_insert (buffer,&iter,"Connecting to the server~\n",-1);
+        }
+        break;
+        default:
+        {
+        char text[200]="Face Authentication Ready.Please Wait!\n";
+        gtk_text_buffer_insert (buffer,&iter,text,-1);
+        }
+
+    }
+    gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(textView), mark);
+    return FALSE;
+}
